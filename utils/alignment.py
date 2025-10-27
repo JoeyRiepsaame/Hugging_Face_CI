@@ -1,57 +1,46 @@
-import subprocess
-from io import StringIO
-from Bio import AlignIO
-from Bio.Align import MultipleSeqAlignment
-from typing import Dict
+import subprocess, tempfile, os
+from typing import List, Tuple
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
-def run_muscle(fasta_dict: Dict[str, str]) -> MultipleSeqAlignment:
-    """Runs MUSCLE on a dictionary of sequences."""
-    fasta_str = ""
-    for seq_id, sequence in fasta_dict.items():
-        fasta_str += f">{seq_id}\n{sequence}\n"
-    
-    # Run MUSCLE process
-    process = subprocess.run(
-        ['muscle', '-in', '-', '-out', '-'],
-        input=fasta_str.encode('utf-8'),
-        capture_output=True,
-        check=True
-    )
-    
-    # Parse the aligned output
-    alignment = AlignIO.read(StringIO(process.stdout.decode('utf-8')), "fasta")
-    return alignment
+def _call_muscle(input_fasta: str) -> str:
+    with tempfile.TemporaryDirectory() as td:
+        in_fa = os.path.join(td, "in.fasta")
+        out_fa = os.path.join(td, "out.fasta")
+        with open(in_fa, "w") as f:
+            f.write(input_fasta)
+        # MUSCLE v5 syntax
+        cmd = ["muscle", "-align", in_fa, "-output", out_fa]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        with open(out_fa, "r") as f:
+            return f.read()
 
-def compute_percent_identity(alignment: MultipleSeqAlignment, reference_id: str) -> Dict[str, float]:
-    """Computes percent identity of each sequence against a reference sequence."""
-    identities = {}
-    try:
-        ref_record = next(rec for rec in alignment if rec.id == reference_id)
-    except StopIteration:
-        raise ValueError(f"Reference ID '{reference_id}' not found in alignment.")
+def percent_identity(ref_aln: str, q_aln: str) -> float:
+    # Identity over non-gap positions in the reference
+    matches = 0
+    denom = 0
+    for r, q in zip(ref_aln, q_aln):
+        if r != "-":
+            denom += 1
+            if q == r:
+                matches += 1
+    return 100.0 * matches / denom if denom else 0.0
 
-    ref_seq = str(ref_record.seq)
-    
-    for record in alignment:
-        if record.id == reference_id:
-            continue
-        
-        matches = 0
-        total_len = 0
-        comp_seq = str(record.seq)
-
-        for i in range(len(ref_seq)):
-            # Only compare positions where the reference is not a gap
-            if ref_seq[i] != '-':
-                total_len += 1
-                if ref_seq[i] == comp_seq[i]:
-                    matches += 1
-        
-        percent_identity = (matches / total_len) * 100 if total_len > 0 else 0
-        identities[record.id] = round(percent_identity, 2)
-        
-    return identities
-
-def alignment_to_clustal_text(alignment: MultipleSeqAlignment) -> str:
-    """Formats the alignment into a string similar to CLUSTAL format."""
-    return alignment.format("clustal")
+def align_and_score(reference_seq: str, sequences: List[Tuple[str, str]]):
+    """
+    reference_seq: raw AA string for reference
+    sequences: list of (name, raw AA string) for candidates
+    Returns: list of dicts: name, length, pct_identity
+    """
+    # Build FASTA with reference first
+    recs = [SeqRecord(Seq(reference_seq), id="REF", description="")]
+    for name, seq in sequences:
+        recs.append(SeqRecord(Seq(seq), id=name, description=""))
+    with tempfile.TemporaryDirectory() as td:
+        in_fa = os.path.join(td, "all.fasta")
+        SeqIO.write(recs, in_fa, "fasta")
+        with open(in_fa) as f:
+            aln_out = _call_muscle(f.read())
+    # Parse aligned FASTA
+    aligned = list(SeqIO.parse(tempfile.NamedTemporaryFile(delete=False, mode="w+"), "fasta"))
